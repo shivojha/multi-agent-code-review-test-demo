@@ -16,7 +16,7 @@ public sealed class InMemoryCache<TValue> : IDisposable
     private readonly Timer _cleanupTimer;
     private readonly TimeSpan _cleanupInterval;
     private readonly object _disposeLock = new();
-    private bool _disposed;
+    private int _disposed; // FIXED: use an interlocked state flag to reduce race windows during disposal checks.
 
     /// <summary>
     /// Initializes a new instance of the <see cref="InMemoryCache{TValue}"/> class.
@@ -88,27 +88,40 @@ public sealed class InMemoryCache<TValue> : IDisposable
 
         while (true)
         {
+            ThrowIfDisposed();
+
             var now = DateTimeOffset.UtcNow;
 
-            if (_entries.TryGetValue(key, out var existing))
-            {
-                if (!existing.IsExpired(now))
+            // FIXED: Store a per-key Lazy<TValue> so factory execution is single-publication under contention.
+            // FIXED: This prevents multiple concurrent threads from executing the factory for the same key.
+            var lazyEntry = _entries.GetOrAdd(
+                key,
+                static (k, state) =>
                 {
-                    return existing.Value;
-                }
+                    var (factoryLocal, ttlLocal) = ((Func<TValue> Factory, TimeSpan Ttl))state!;
+                    return CacheEntry.CreatePending(factoryLocal, ttlLocal);
+                },
+                (factory, ttl));
 
-                _entries.TryRemove(new KeyValuePair<string, CacheEntry>(key, existing));
+            if (lazyEntry.IsExpired(now))
+            {
+                // FIXED: Remove expired entries using a compare-and-remove loop and retry to avoid stale race windows.
+                _entries.TryRemove(new KeyValuePair<string, CacheEntry>(key, lazyEntry));
+                continue;
             }
 
-            var value = factory();
-            var newEntry = new CacheEntry(value, now.Add(ttl));
-
-            if (_entries.TryAdd(key, newEntry))
+            try
             {
+                var value = lazyEntry.GetValue();
+                ThrowIfDisposed();
                 return value;
             }
-
-            // Another thread may have won the race. Loop to read the authoritative value.
+            catch
+            {
+                // FIXED: If value creation fails, remove the failed placeholder so future calls can retry.
+                _entries.TryRemove(new KeyValuePair<string, CacheEntry>(key, lazyEntry));
+                throw;
+            }
         }
     }
 
@@ -147,12 +160,10 @@ public sealed class InMemoryCache<TValue> : IDisposable
     {
         lock (_disposeLock)
         {
-            if (_disposed)
+            if (Interlocked.Exchange(ref _disposed, 1) == 1)
             {
                 return;
             }
-
-            _disposed = true;
         }
 
         _cleanupTimer.Dispose();
@@ -162,7 +173,7 @@ public sealed class InMemoryCache<TValue> : IDisposable
 
     private void CleanupExpiredEntries()
     {
-        if (_disposed)
+        if (Volatile.Read(ref _disposed) == 1)
         {
             return;
         }
@@ -173,21 +184,55 @@ public sealed class InMemoryCache<TValue> : IDisposable
         {
             if (kvp.Value.IsExpired(now))
             {
-                _entries.TryRemove(kvp.Key, out _);
+                _entries.TryRemove(new KeyValuePair<string, CacheEntry>(kvp.Key, kvp.Value));
             }
         }
     }
 
     private void ThrowIfDisposed()
     {
-        if (_disposed)
+        if (Volatile.Read(ref _disposed) == 1)
         {
             throw new ObjectDisposedException(nameof(InMemoryCache<TValue>));
         }
     }
 
-    private sealed record CacheEntry(TValue Value, DateTimeOffset ExpiresAt)
+    private sealed class CacheEntry
     {
-        public bool IsExpired(DateTimeOffset utcNow) => utcNow >= ExpiresAt;
+        private readonly Lazy<TValue>? _lazyValue;
+        private readonly DateTimeOffset _expiresAt;
+        private readonly bool _isPending;
+
+        private CacheEntry(Lazy<TValue> lazyValue, DateTimeOffset expiresAt)
+        {
+            _lazyValue = lazyValue;
+            _expiresAt = expiresAt;
+            _isPending = true;
+        }
+
+        private CacheEntry(TValue value, DateTimeOffset expiresAt)
+        {
+            Value = value;
+            _expiresAt = expiresAt;
+            _isPending = false;
+        }
+
+        public TValue Value { get; }
+
+        public static CacheEntry CreatePending(Func<TValue> factory, TimeSpan ttl)
+        {
+            var expiresAt = DateTimeOffset.UtcNow.Add(ttl);
+            var lazy = new Lazy<TValue>(factory, LazyThreadSafetyMode.ExecutionAndPublication);
+            return new CacheEntry(lazy, expiresAt);
+        }
+
+        public TValue GetValue()
+        {
+            return _isPending
+                ? _lazyValue!.Value
+                : Value;
+        }
+
+        public bool IsExpired(DateTimeOffset utcNow) => utcNow >= _expiresAt;
     }
 }
